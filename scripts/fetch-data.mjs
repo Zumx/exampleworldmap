@@ -11,6 +11,7 @@ import { writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import booleanPointInPolygon from "@turf/boolean-point-in-polygon";
+import { writeCountryIndex } from "./build-index.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
@@ -21,7 +22,40 @@ const site = JSON.parse(
 );
 const OSM_KEY = site.osm.key;
 const OSM_VALUE = site.osm.value;
+// One or more OSM key/value filters. Defaults to the primary osm tag;
+// multi-tag sites (mineshaft+mine, sport=motor+highway=raceway) set
+// site.osmFilters: [{ key, value }, ...].
+const FILTERS =
+  Array.isArray(site.osmFilters) && site.osmFilters.length
+    ? site.osmFilters
+    : [{ key: OSM_KEY, value: OSM_VALUE }];
+// Include relations (multipolygons) — needed for area features like reefs.
+// "out center" then yields a centroid for ways and relations alike.
+const INCLUDE_RELATIONS = site.includeRelations === true;
+// Drop points within this many metres of an already-kept point (collapses
+// overlapping representations of one place, e.g. a raceway way plus a
+// sport=motor node). 0 = no proximity dedup.
+const DEDUPE_M = Number.isFinite(site.dedupeMeters) ? site.dedupeMeters : 0;
 const NAMED_ONLY = site.namedOnly === true;
+// Optional config-driven tag filter (Overpass source). Backward-compatible:
+// absent => no extra filtering. Shape:
+//   { "requireName": true, "anyOf": [ { "key": "access", "values": ["yes"] } ] }
+// Keeps a feature only if it has a name (when requireName) AND at least one
+// anyOf condition matches one of the element's tag values.
+const INCLUDE = site.includeFilter || null;
+function passesInclude(tags, name) {
+  if (!INCLUDE) return true;
+  if (INCLUDE.requireName && !name) return false;
+  if (Array.isArray(INCLUDE.anyOf) && INCLUDE.anyOf.length) {
+    const ok = INCLUDE.anyOf.some(
+      (c) => c && Array.isArray(c.values) && c.values.includes(tags[c.key])
+    );
+    if (!ok) return false;
+  }
+  return true;
+}
+// Pluggable data source: "overpass" (default) or "openbrewerydb".
+const DATA_SOURCE = site.dataSource || { type: "overpass" };
 const GP = site.googlePlaces || {};
 const GP_KEY = process.env.GOOGLE_PLACES_API_KEY || "";
 
@@ -45,12 +79,57 @@ const LAT_MIN = -60,
   LON_MAX = 180;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const buildQuery = (s, w, n, e) => `[out:json][timeout:180];
+// Grid-bucketed proximity dedupe: keep a feature only if no already-kept
+// feature lies within `meters`. Named features win over unnamed ones, so
+// pass 1 keeps all named, pass 2 adds unnamed that are still isolated.
+function proximityDedupe(features, meters) {
+  const cell = meters / 111320; // ~degrees latitude per metre
+  const kept = [];
+  const grid = new Map();
+  const near = (lon, lat) => {
+    const gx = Math.floor(lon / cell);
+    const gy = Math.floor(lat / cell);
+    for (let dx = -1; dx <= 1; dx++)
+      for (let dy = -1; dy <= 1; dy++) {
+        const bucket = grid.get(`${gx + dx}:${gy + dy}`);
+        if (!bucket) continue;
+        for (const [bl, ba] of bucket) {
+          const mx = (lon - bl) * 111320 * Math.cos((lat * Math.PI) / 180);
+          const my = (lat - ba) * 111320;
+          if (mx * mx + my * my <= meters * meters) return true;
+        }
+      }
+    return false;
+  };
+  const add = (f) => {
+    const [lon, lat] = f.geometry.coordinates;
+    if (near(lon, lat)) return;
+    kept.push(f);
+    const k = `${Math.floor(lon / cell)}:${Math.floor(lat / cell)}`;
+    let b = grid.get(k);
+    if (!b) grid.set(k, (b = []));
+    b.push([lon, lat]);
+  };
+  for (const f of features) if (f.properties.name) add(f);
+  for (const f of features) if (!f.properties.name) add(f);
+  return kept;
+}
+
+const buildQuery = (s, w, n, e) => {
+  const bbox = `(${s},${w},${n},${e})`;
+  const lines = [];
+  for (const { key, value } of FILTERS) {
+    const sel = `["${key}"="${value}"]`;
+    lines.push(`  node${sel}${bbox};`);
+    lines.push(`  way${sel}${bbox};`);
+    if (INCLUDE_RELATIONS) lines.push(`  relation${sel}${bbox};`);
+  }
+  return `[out:json][timeout:180];
 (
-  node["${OSM_KEY}"="${OSM_VALUE}"](${s},${w},${n},${e});
-  way["${OSM_KEY}"="${OSM_VALUE}"](${s},${w},${n},${e});
+${lines.join("\n")}
 );
 out center tags;`;
+};
 
 async function fetchTile(s, w, n, e) {
   const body = "data=" + encodeURIComponent(buildQuery(s, w, n, e));
@@ -134,6 +213,22 @@ function countryFor(countries, lon, lat) {
   return null;
 }
 
+// Compose a human address from OSM addr:* tags (best-effort; null if none).
+function osmAddress(t) {
+  if (t["addr:full"]) return t["addr:full"];
+  const line = [t["addr:housenumber"], t["addr:street"]]
+    .filter(Boolean)
+    .join(" ");
+  const parts = [
+    line,
+    t["addr:postcode"] && t["addr:city"]
+      ? `${t["addr:postcode"]} ${t["addr:city"]}`
+      : t["addr:city"] || t["addr:postcode"],
+    t["addr:country"],
+  ].filter(Boolean);
+  return parts.length ? parts.join(", ") : null;
+}
+
 // ---- metaFields -> OSM tag resolution (the slot system) ----
 function resolveMeta(tags) {
   const out = {};
@@ -199,7 +294,91 @@ async function enrichGoogle(features) {
   console.log(`Google Places: enriched ${done}.`);
 }
 
+// ---- OpenBreweryDB source (paginated REST, no Overpass) ----
+async function fetchOpenBreweryDb() {
+  const features = [];
+  const seen = new Set();
+  for (let page = 1; page < 1000; page++) {
+    const url = `https://api.openbrewerydb.org/v1/breweries?per_page=200&page=${page}`;
+    let list = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const res = await fetch(url, {
+          headers: { "User-Agent": HEADERS["User-Agent"], Accept: "application/json" },
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        list = await res.json();
+        break;
+      } catch (err) {
+        console.log(`  retry page ${page} (${attempt + 1}): ${err.message}`);
+        await sleep(3000 + attempt * 2000);
+      }
+    }
+    if (!Array.isArray(list) || list.length === 0) {
+      console.log(`Page ${page}: empty — done.`);
+      break;
+    }
+    let added = 0;
+    for (const b of list) {
+      if (seen.has(b.id)) continue;
+      const lat = b.latitude != null ? +b.latitude : null;
+      const lon = b.longitude != null ? +b.longitude : null;
+      if (lat == null || lon == null || !Number.isFinite(lat) || !Number.isFinite(lon))
+        continue;
+      seen.add(b.id);
+      const name = b.name || null;
+      if (NAMED_ONLY && !name) continue;
+      features.push({
+        type: "Feature",
+        geometry: {
+          type: "Point",
+          coordinates: [+lon.toFixed(5), +lat.toFixed(5)],
+        },
+        properties: {
+          name,
+          country: b.country || null,
+          website: b.website_url || null,
+          opening_hours: null,
+          capacity: null,
+          phone: b.phone || null,
+          address:
+            [
+              b.street,
+              [b.postal_code, b.city].filter(Boolean).join(" "),
+              b.state || b.state_province,
+              b.country,
+            ]
+              .filter(Boolean)
+              .join(", ") || null,
+          city: b.city || null,
+          state: b.state || b.state_province || null,
+          type: b.brewery_type || null,
+        },
+      });
+      added++;
+    }
+    console.log(`Page ${page}: ${list.length} rows, +${added} (total ${features.length})`);
+    await sleep(250);
+  }
+  return features;
+}
+
 async function main() {
+  if (DATA_SOURCE.type === "openbrewerydb") {
+    console.log("Source: OpenBreweryDB (paginated REST)");
+    const features = await fetchOpenBreweryDb();
+    await enrichGoogle(features);
+    const out = join(ROOT, "public", "data", "points.geojson");
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, JSON.stringify({ type: "FeatureCollection", features }));
+    writeCountryIndex(features, join(ROOT, "public", "data"));
+    const withCountry = features.filter((f) => f.properties.country).length;
+    console.log(
+      `\nWrote ${features.length} features (${withCountry} country-tagged) -> ${out}`
+    );
+    return;
+  }
+
   const countries = await loadCountries();
   console.log(`Country polygons: ${countries.length}`);
 
@@ -215,7 +394,10 @@ async function main() {
         Math.min(lon + TILE, LON_MAX),
       ]);
 
-  console.log(`Fetching ${OSM_KEY}=${OSM_VALUE} in ${tiles.length} tiles...`);
+  const filterDesc = FILTERS.map((f) => `${f.key}=${f.value}`).join(" + ");
+  console.log(
+    `Fetching ${filterDesc}${INCLUDE_RELATIONS ? " (+relations)" : ""} in ${tiles.length} tiles...`
+  );
   let i = 0;
   for (const [s, w, n, e] of tiles) {
     i++;
@@ -231,6 +413,7 @@ async function main() {
       const t = el.tags || {};
       const name = t.name || t["name:en"] || null;
       if (NAMED_ONLY && !name) continue;
+      if (!passesInclude(t, name)) continue;
       seen.add(key);
       features.push({
         type: "Feature",
@@ -245,6 +428,7 @@ async function main() {
           opening_hours: t.opening_hours || null,
           capacity: t.capacity || null,
           phone: t.phone || t["contact:phone"] || null,
+          address: osmAddress(t),
           osmType: el.type,
           osmId: el.id,
           ...resolveMeta(t),
@@ -256,14 +440,24 @@ async function main() {
     await sleep(1200);
   }
 
-  await enrichGoogle(features);
+  const deduped = DEDUPE_M > 0 ? proximityDedupe(features, DEDUPE_M) : features;
+  if (deduped !== features)
+    console.log(
+      `Proximity dedupe (${DEDUPE_M}m): ${features.length} -> ${deduped.length}`
+    );
+
+  await enrichGoogle(deduped);
 
   const out = join(ROOT, "public", "data", "points.geojson");
   mkdirSync(dirname(out), { recursive: true });
-  writeFileSync(out, JSON.stringify({ type: "FeatureCollection", features }));
-  const withCountry = features.filter((f) => f.properties.country).length;
+  writeFileSync(
+    out,
+    JSON.stringify({ type: "FeatureCollection", features: deduped })
+  );
+  writeCountryIndex(deduped, join(ROOT, "public", "data"));
+  const withCountry = deduped.filter((f) => f.properties.country).length;
   console.log(
-    `\nWrote ${features.length} features (${withCountry} country-tagged) -> ${out}`
+    `\nWrote ${deduped.length} features (${withCountry} country-tagged) -> ${out}`
   );
 }
 
